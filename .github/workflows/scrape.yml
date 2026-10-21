@@ -1,0 +1,52 @@
+name: Hello Cycling Scraper
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# 同時に2つ動かないようにする（後から来た回は前の回の終了を待つ）
+concurrency:
+  group: hello-cycling-scraper
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install pandas requests
+
+      - name: Run scraper
+        run: python scrape.py
+
+      # 取得に失敗した回も，欠損行を記録するためにコミットする
+      - name: Commit and push data
+        if: ${{ !cancelled() }}
+        env:
+          TZ: Asia/Tokyo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --staged --quiet; then
+            echo "変更なし"
+            exit 0
+          fi
+          git commit -m "Auto-update data $(date '+%Y-%m-%d %H:%M JST')"
+          for i in 1 2 3; do
+            git pull --rebase origin "${GITHUB_REF_NAME}" && git push origin HEAD:"${GITHUB_REF_NAME}" && exit 0
+            echo "push失敗（${i}回目），再試行します"
+            sleep 5
+          done
+          exit 1
