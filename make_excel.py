@@ -2,15 +2,21 @@
 
 シート
   最新の状況   各ステーションの最新の台数と状態
+  グラフ(15分ごと)   直近7日の15分ごとの推移（全体＋ステーションごと）
+  グラフ(1時間ごと)  直近30日の1時間平均の推移
   日別集計     ステーション×日ごとの満車・空車の回数と割合
   台数推移     直近7日の貸出可能台数（行＝日時，列＝ステーション）．色の濃さで台数が分かる
   直近7日の全データ  15分ごとの全記録（フィルターつき）
   説明         列と色の意味
+  グラフ用データ(15分)/(1時間)  グラフの元データ
 """
 from datetime import timedelta
 
 import pandas as pd
 from openpyxl import Workbook
+from openpyxl.chart import LineChart, Reference
+from openpyxl.chart.axis import ChartLines
+from openpyxl.drawing.text import CharacterProperties, ParagraphProperties
 from openpyxl.formatting.rule import ColorScaleRule, DataBarRule, FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -273,6 +279,170 @@ def sheet_help(wb):
     outline(ws, 4, 1, 3 + len(rows), 2)
 
 
+# ---------------------------------------------------------------------------
+# グラフ
+# ---------------------------------------------------------------------------
+HOURLY_DAYS = 30  # 1時間ごとのグラフに使う期間
+
+
+def build_series(df, info, freq):
+    """グラフ用の表を作る．freq="15min" はそのまま，"1h" は1時間ごとの平均．
+
+    返り値：行＝時刻ラベル，列＝ [空車ステーション数, 満車ステーション数,
+            (各ステーションの) 貸出可能台数, 貸出不可台数, 容量]
+    """
+    d = df[df["状態"] != "欠損"].copy()
+    d["t"] = pd.to_datetime(d["日時"], format="%Y/%m/%d %H:%M")
+    if freq == "1h":
+        d["t"] = d["t"].dt.floor("h")
+    d["空車"] = (d["状態"] == "空車").astype(int)
+    d["満車"] = (d["状態"] == "満車").astype(int)
+
+    # 全体：時刻ごとの空車・満車ステーション数（1時間ごとは4回分の平均）
+    per_time = d.groupby(["t", "日時"])[["空車", "満車"]].sum().reset_index()
+    overall = per_time.groupby("t")[["空車", "満車"]].mean()
+    overall.columns = ["空車ステーション数", "満車ステーション数"]
+
+    avail = d.pivot_table(index="t", columns="ステーションID", values="貸出可能台数", aggfunc="mean")
+    unavail = d.pivot_table(index="t", columns="ステーションID", values="貸出不可台数", aggfunc="mean")
+
+    order = [s for s in info.sort_values(["区", "ステーションID"])["ステーションID"] if s in avail.columns]
+    cap = info.set_index("ステーションID")["容量"]
+    out = overall.copy()
+    for sid in order:
+        out[(sid, "貸出可能台数")] = avail[sid]
+        out[(sid, "貸出不可台数")] = unavail[sid]
+        out[(sid, "容量")] = cap[sid]
+    out = out.sort_index().round(2)
+    fmt = "%m/%d %H:%M" if freq == "15min" else "%m/%d %H時"
+    out.index = out.index.strftime(fmt)
+    return out, order
+
+
+def write_chart_data(wb, name, table, info):
+    """グラフの元データをシートに書く．各ステーションの先頭列番号を返す．"""
+    ws = wb.create_sheet(name)
+    ws.sheet_properties.tabColor = "A6A6A6"
+    names = info.set_index("ステーションID")["ステーション名"]
+    ws.cell(row=1, column=1, value="日時")
+    col_of = {}
+    for j, key in enumerate(table.columns, 2):
+        if isinstance(key, tuple):
+            sid, kind = key
+            label = kind
+            col_of.setdefault(sid, j)
+        else:
+            label = key
+        ws.cell(row=1, column=j, value=label)
+    for i, (t, row) in enumerate(table.iterrows(), 2):
+        ws.cell(row=i, column=1, value=t)
+        for j, v in enumerate(row, 2):
+            ws.cell(row=i, column=j, value=None if pd.isna(v) else float(v))
+    # 2行目以降の見出しが分かるよう，0行目代わりにコメント的な行は入れず，列幅だけ整える
+    for c in ws[1]:
+        c.font, c.fill, c.alignment, c.border = F_HEAD, FILL_HEAD, CENTER, BORDER
+    ws.column_dimensions["A"].width = 14
+    ws.freeze_panes = "B2"
+    # どのステーションの列かを2段目の見出しとして上に挿入する
+    ws.insert_rows(1)
+    for sid, j in col_of.items():
+        ws.cell(row=1, column=j, value=f"{names[sid]}({sid})")
+        ws.merge_cells(start_row=1, start_column=j, end_row=1, end_column=j + 2)
+        ws.cell(row=1, column=j).font = Font(name=FONT_NAME, size=10, bold=True)
+        ws.cell(row=1, column=j).alignment = CENTER
+    ws.cell(row=1, column=2, value="全体").font = Font(name=FONT_NAME, size=10, bold=True)
+    ws.freeze_panes = "B3"
+    return ws, col_of
+
+
+def style_line(series, color, width=19050, dash=None, smooth=False):
+    series.graphicalProperties.line.solidFill = color
+    series.graphicalProperties.line.width = width
+    if dash:
+        series.graphicalProperties.line.dashStyle = dash
+    series.smooth = smooth
+    series.marker.symbol = "none"
+
+
+def make_line_chart(title_text, x_title, skip, y_max=None):
+    ch = LineChart()
+    ch.title = title_text
+    # タイトルの文字を小さめにする
+    for para in ch.title.tx.rich.p:
+        para.pPr = ParagraphProperties(defRPr=CharacterProperties(sz=1100, b=True))
+        for run in para.r or []:
+            run.rPr = CharacterProperties(sz=1100, b=True)
+    ch.height, ch.width = 7.5, 16
+    ch.y_axis.title = "台数"
+    ch.x_axis.title = x_title
+    ch.y_axis.scaling.min = 0
+    if y_max is not None:
+        ch.y_axis.scaling.max = y_max
+    ch.y_axis.majorGridlines = ChartLines()
+    ch.x_axis.tickLblSkip = skip
+    ch.x_axis.tickMarkSkip = skip
+    ch.x_axis.delete = False
+    ch.y_axis.delete = False
+    ch.legend.position = "b"
+    return ch
+
+
+def sheet_charts(wb, sheet_name, data_ws, col_of, n_rows, info, heading, note, x_title, skip):
+    ws = wb.create_sheet(sheet_name)
+    ws.sheet_properties.tabColor = "70AD47"
+    title(ws, heading, note)
+    first, last = 3, 2 + n_rows  # データは3行目から
+    cats = Reference(data_ws, min_col=1, min_row=first, max_row=last)
+
+    # 全体のグラフ（空車・満車のステーション数）
+    ch = make_line_chart("全体：空車・満車になっているステーション数", x_title, skip)
+    ch.y_axis.title = "ステーション数"
+    ch.width = 33
+    for col, color in ((2, "2E75B6"), (3, "C00000")):
+        ch.add_data(Reference(data_ws, min_col=col, min_row=2, max_row=last), titles_from_data=True)
+        style_line(ch.series[-1], color, width=25400)
+    ch.set_categories(cats)
+    ws.add_chart(ch, "A4")
+
+    # ステーションごとのグラフ（2列に並べる）
+    meta = info.set_index("ステーションID")
+    for k, (sid, c0) in enumerate(col_of.items()):
+        m = meta.loc[sid]
+        cap = int(m["容量"])
+        # 容量の線が枠の上端に重ならないよう，少し余白をとる
+        y_max = cap + max(2, -(-cap * 15 // 100))
+        ch = make_line_chart(f"{m['区']} {m['ステーション名']}（容量{cap}）", x_title, skip, y_max=y_max)
+        for off, color, dash in ((0, "548235", None), (1, "C00000", None), (2, "404040", "dash")):
+            ch.add_data(Reference(data_ws, min_col=c0 + off, min_row=2, max_row=last), titles_from_data=True)
+            style_line(ch.series[-1], color, width=22225 if off == 0 else 15875, dash=dash)
+        ch.set_categories(cats)
+        row = 21 + (k // 2) * 16
+        col = "A" if k % 2 == 0 else "K"
+        ws.add_chart(ch, f"{col}{row}")
+
+
+def add_chart_sheets(wb, df, info):
+    times = pd.to_datetime(df["日時"], format="%Y/%m/%d %H:%M")
+
+    # 15分ごと（直近7日）
+    recent = df[times >= times.max() - timedelta(days=RECENT_DAYS)]
+    t15, _ = build_series(recent, info, "15min")
+    # 1時間ごと（直近30日の1時間平均）
+    month = df[times >= times.max() - timedelta(days=HOURLY_DAYS)]
+    t1h, _ = build_series(month, info, "1h")
+
+    d15, col15 = write_chart_data(wb, "グラフ用データ(15分)", t15, info)
+    d1h, col1h = write_chart_data(wb, "グラフ用データ(1時間)", t1h, info)
+
+    common = "緑＝貸出可能台数，赤＝貸出不可台数（故障・電池切れ・予約中などの目安），灰色の点線＝容量．"
+    sheet_charts(wb, "グラフ(15分ごと)", d15, col15, len(t15), info,
+                 f"15分ごとの推移（直近{RECENT_DAYS}日）",
+                 common + "緑が0なら空車，緑＋赤が灰色の線に届けば満車．", "日時", skip=8)
+    sheet_charts(wb, "グラフ(1時間ごと)", d1h, col1h, len(t1h), info,
+                 f"1時間ごとの推移（直近{HOURLY_DAYS}日，1時間ごとの平均）",
+                 common + "細かな変動をならして，1日の中の傾向を見やすくしたもの．", "日時", skip=6)
+
+
 def main():
     df = pd.read_csv(f"{OUT_DIR}/all_data.csv", dtype={"ステーションID": str}, encoding="utf-8-sig")
     daily = pd.read_csv(f"{OUT_DIR}/daily_by_station.csv", dtype={"ステーションID": str}, encoding="utf-8-sig")
@@ -285,10 +455,14 @@ def main():
 
     wb = Workbook()
     sheet_latest(wb, df)
+    add_chart_sheets(wb, df, info)
     sheet_daily(wb, daily)
     sheet_wide(wb, recent, info)
     sheet_all(wb, recent)
     sheet_help(wb)
+    # グラフの元データのシートは最後に回す
+    data_sheets = [ws for ws in wb._sheets if ws.title.startswith("グラフ用データ")]
+    wb._sheets = [ws for ws in wb._sheets if ws not in data_sheets] + data_sheets
     wb.save(f"{OUT_DIR}/summary.xlsx")
     print(f"✅ Excelを作成しました → {OUT_DIR}/summary.xlsx")
 
