@@ -16,7 +16,9 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.chart import LineChart, Reference
 from openpyxl.chart.axis import ChartLines
-from openpyxl.drawing.text import CharacterProperties, ParagraphProperties
+from openpyxl.chart.layout import Layout, ManualLayout
+from openpyxl.chart.text import RichText
+from openpyxl.drawing.text import CharacterProperties, Paragraph, ParagraphProperties, RichTextProperties
 from openpyxl.formatting.rule import ColorScaleRule, DataBarRule, FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -314,7 +316,7 @@ def build_series(df, info, freq):
         out[(sid, "貸出不可台数")] = unavail[sid]
         out[(sid, "容量")] = cap[sid]
     out = out.sort_index().round(2)
-    fmt = "%m/%d %H:%M" if freq == "15min" else "%m/%d %H時"
+    fmt = "%m/%d %H:%M" if freq == "15min" else "%m/%d %H:00"
     out.index = out.index.strftime(fmt)
     return out, order
 
@@ -364,26 +366,48 @@ def style_line(series, color, width=19050, dash=None, smooth=False):
     series.marker.symbol = "none"
 
 
-def make_line_chart(title_text, x_title, skip, y_max=None):
+def _txt(size, bold=False, rot=None):
+    """軸ラベルや凡例の文字の大きさ・向きを指定する．"""
+    body = RichTextProperties(rot=rot, vert="horz") if rot is not None else RichTextProperties()
+    cp = CharacterProperties(sz=size, b=bold)
+    return RichText(bodyPr=body, p=[Paragraph(pPr=ParagraphProperties(defRPr=cp), endParaRPr=cp)])
+
+
+def make_line_chart(title_text, skip, y_max=None, width=16, height=9):
+    """文字が重ならないよう，タイトル・グラフ本体・軸ラベル・凡例の位置を固定した折れ線グラフ．"""
     ch = LineChart()
     ch.title = title_text
-    # タイトルの文字を小さめにする
     for para in ch.title.tx.rich.p:
         para.pPr = ParagraphProperties(defRPr=CharacterProperties(sz=1100, b=True))
         for run in para.r or []:
             run.rPr = CharacterProperties(sz=1100, b=True)
-    ch.height, ch.width = 7.5, 16
-    ch.y_axis.title = "台数"
-    ch.x_axis.title = x_title
+    ch.title.overlay = False
+    ch.height, ch.width = height, width
+
+    # 軸のタイトルは付けない（単位はシート上部の説明に書く）．付けると目盛りの数字と重なりやすい
     ch.y_axis.scaling.min = 0
     if y_max is not None:
         ch.y_axis.scaling.max = y_max
     ch.y_axis.majorGridlines = ChartLines()
+    ch.y_axis.txPr = _txt(800)
+    ch.y_axis.delete = False
+
+    # 横軸の日時ラベルは斜め45度・小さめの文字にし，間引いて表示する
     ch.x_axis.tickLblSkip = skip
     ch.x_axis.tickMarkSkip = skip
+    ch.x_axis.txPr = _txt(800, rot=-2700000)
     ch.x_axis.delete = False
-    ch.y_axis.delete = False
+
+    # 凡例は下端に置き，グラフ本体と重ならないようにする
     ch.legend.position = "b"
+    ch.legend.overlay = False
+    ch.legend.txPr = _txt(900)
+
+    # グラフ本体（目盛りの内側）の位置と大きさを固定する．
+    # 上14%にタイトル，下に斜めの日時ラベルと凡例が入る余白を確保する
+    ch.plot_area.layout = Layout(manualLayout=ManualLayout(
+        layoutTarget="inner", xMode="edge", yMode="edge",
+        x=0.07, y=0.13, w=0.90, h=0.52))
     return ch
 
 
@@ -394,10 +418,12 @@ def sheet_charts(wb, sheet_name, data_ws, col_of, n_rows, info, heading, note, x
     first, last = 3, 2 + n_rows  # データは3行目から
     cats = Reference(data_ws, min_col=1, min_row=first, max_row=last)
 
+    def label_skip(n_labels):
+        # 横軸の日時ラベルが n_labels 個前後になるように間引く
+        return max(1, -(-n_rows // n_labels))
+
     # 全体のグラフ（空車・満車のステーション数）
-    ch = make_line_chart("全体：空車・満車になっているステーション数", x_title, skip)
-    ch.y_axis.title = "ステーション数"
-    ch.width = 33
+    ch = make_line_chart("全体：空車・満車になっているステーション数", label_skip(24), width=33)
     for col, color in ((2, "2E75B6"), (3, "C00000")):
         ch.add_data(Reference(data_ws, min_col=col, min_row=2, max_row=last), titles_from_data=True)
         style_line(ch.series[-1], color, width=25400)
@@ -411,12 +437,12 @@ def sheet_charts(wb, sheet_name, data_ws, col_of, n_rows, info, heading, note, x
         cap = int(m["容量"])
         # 容量の線が枠の上端に重ならないよう，少し余白をとる
         y_max = cap + max(2, -(-cap * 15 // 100))
-        ch = make_line_chart(f"{m['区']} {m['ステーション名']}（容量{cap}）", x_title, skip, y_max=y_max)
+        ch = make_line_chart(f"{m['区']} {m['ステーション名']}（容量{cap}）", label_skip(12), y_max=y_max)
         for off, color, dash in ((0, "548235", None), (1, "C00000", None), (2, "404040", "dash")):
             ch.add_data(Reference(data_ws, min_col=c0 + off, min_row=2, max_row=last), titles_from_data=True)
             style_line(ch.series[-1], color, width=22225 if off == 0 else 15875, dash=dash)
         ch.set_categories(cats)
-        row = 21 + (k // 2) * 16
+        row = 24 + (k // 2) * 19
         col = "A" if k % 2 == 0 else "K"
         ws.add_chart(ch, f"{col}{row}")
 
@@ -434,7 +460,7 @@ def add_chart_sheets(wb, df, info):
     d15, col15 = write_chart_data(wb, "グラフ用データ(15分)", t15, info)
     d1h, col1h = write_chart_data(wb, "グラフ用データ(1時間)", t1h, info)
 
-    common = "緑＝貸出可能台数，赤＝貸出不可台数（故障・電池切れ・予約中などの目安），灰色の点線＝容量．"
+    common = "縦軸は台数（全体のグラフはステーション数）．緑＝貸出可能台数，赤＝貸出不可台数（故障・電池切れ・予約中などの目安），灰色の点線＝容量．"
     sheet_charts(wb, "グラフ(15分ごと)", d15, col15, len(t15), info,
                  f"15分ごとの推移（直近{RECENT_DAYS}日）",
                  common + "緑が0なら空車，緑＋赤が灰色の線に届けば満車．", "日時", skip=8)
