@@ -43,7 +43,9 @@ DATA_DIR = "data"
 OUT_DIR = "reports"
 EXPECTED = 96          # 1日の取得回数（15分ごと）
 BIG_CHANGE = 3         # 15分でこの台数以上増減したら「業者作業の候補」
-LAT, LON = 35.448, 139.630  # 天気を取る地点（横浜市中区・西区の境付近）
+AMEDAS = "46106"           # 気象庁アメダス「横浜」（横浜地方気象台，中区山手町）．中区・西区に最も近い観測所
+LAT, LON = 35.448, 139.630  # 予備（Open-Meteo）で天気を取る地点（横浜市中区・西区の境付近）
+WEATHER_COLS = ["天気", "気温(℃)", "降水量(mm)", "日照(分)", "湿度(%)", "風速(m/s)"]
 RAW_SHEET = "15分ごとのデータ"
 WEEK = "月火水木金土日"
 
@@ -115,7 +117,69 @@ def day_label(d):
 
 
 def fetch_weather(d):
-    """Open-Meteo から1時間ごとの気温・降水量・天気を取る．取れなければ None．"""
+    """1時間ごとの天気を取る．まず気象庁アメダス「横浜」の観測値，取れなければ Open-Meteo のモデル値．"""
+    w = fetch_jma(d)
+    if w is None:
+        w = fetch_open_meteo(d)
+    return w
+
+
+def fetch_jma(d):
+    """気象庁アメダス「横浜」の10分ごとの観測値を1時間ごとにまとめる（直近10日ほどしか公開されていない）．"""
+    raw = {}
+    blocks = [(d, h) for h in range(0, 24, 3)] + [(d + timedelta(days=1), 0)]
+    for day, h in blocks:
+        url = f"https://www.jma.go.jp/bosai/amedas/data/point/{AMEDAS}/{day:%Y%m%d}_{h:02d}.json"
+        try:
+            r = requests.get(url, timeout=30)
+            r.raise_for_status()
+            raw.update(r.json())
+        except Exception as e:
+            print(f"  アメダスの取得に失敗（{url}）: {e}")
+            if day == d:
+                return None  # その日の分が欠けたら使わない（翌日0時の分だけなら続ける）
+
+    def val(v, key):
+        x = v.get(key)
+        return x[0] if isinstance(x, list) and x else None
+
+    rec = pd.DataFrame([{
+        "t": datetime.strptime(k, "%Y%m%d%H%M%S"),
+        "temp": val(v, "temp"), "p10": val(v, "precipitation10m"), "sun10": val(v, "sun10m"),
+        "hum": val(v, "humidity"), "wind": val(v, "wind"),
+    } for k, v in raw.items()])
+    if rec.empty:
+        return None
+    for c in ["temp", "p10", "sun10", "hum", "wind"]:
+        rec[c] = pd.to_numeric(rec[c], errors="coerce")
+    start = datetime(d.year, d.month, d.day)
+    rows = []
+    for h in range(24):
+        t0 = start + timedelta(hours=h)
+        now = rec[(rec["t"] >= t0) & (rec["t"] < t0 + timedelta(hours=1))]        # h:00〜h:50 の瞬間値
+        acc = rec[(rec["t"] > t0) & (rec["t"] <= t0 + timedelta(hours=1))]        # h:00〜h+1:00 の10分間の量
+        p = acc["p10"].sum(min_count=1)
+        sun = acc["sun10"].sum(min_count=1)
+        if pd.notna(p) and p >= 0.5:
+            wx = "雨"
+        elif 7 <= h <= 16 and pd.notna(sun):
+            wx = "晴れ" if sun >= 30 else "晴れ時々曇り" if sun >= 10 else "曇り"
+        else:
+            wx = "－" if pd.isna(p) or p == 0 else "弱い雨"
+        rows.append({"時": h, "天気": wx, "気温(℃)": now["temp"].mean(), "降水量(mm)": p,
+                     "日照(分)": sun, "湿度(%)": now["hum"].mean(), "風速(m/s)": now["wind"].mean()})
+    w = pd.DataFrame(rows)
+    for c in ["気温(℃)", "降水量(mm)", "日照(分)", "湿度(%)", "風速(m/s)"]:
+        w[c] = w[c].astype(float).round(1)
+    if w["気温(℃)"].notna().sum() < 20:
+        return None
+    w.attrs["source"] = "気象庁 アメダス「横浜」（中区山手町）の観測値"
+    w.attrs["short"] = "気象庁ホームページ（アメダス横浜）"
+    return w
+
+
+def fetch_open_meteo(d):
+    """Open-Meteo から1時間ごとの気温・降水量・天気を取る（予備）．取れなければ None．"""
     params = {"latitude": LAT, "longitude": LON, "timezone": "Asia/Tokyo",
               "hourly": "temperature_2m,precipitation,weather_code",
               "start_date": d.isoformat(), "end_date": d.isoformat()}
@@ -134,6 +198,8 @@ def fetch_weather(d):
             w["気温(℃)"] = w["気温(℃)"].round(1)
             w["降水量(mm)"] = w["降水量(mm)"].round(1)
             if len(w) == 24 and w["気温(℃)"].notna().all():
+                w.attrs["source"] = "Open-Meteo.com（CC BY 4.0）の気象モデル値（アメダスが取れなかったため）"
+                w.attrs["short"] = "Open-Meteo.com（CC BY 4.0）"
                 return w
         except Exception as e:
             print(f"  天気の取得に失敗（{url}）: {e}")
@@ -322,8 +388,9 @@ def texts(a, w, prev_tot):
     if w is not None:
         rain = w["降水量(mm)"].fillna(0)
         rh = w[rain >= 0.5]["時"].tolist()
+        sun = (f"，日照時間は {w['日照(分)'].sum() / 60:.1f} 時間" if "日照(分)" in w.columns and w["日照(分)"].notna().any() else "")
         t4 = [f"気温は最高 {w['気温(℃)'].max():.1f}℃，最低 {w['気温(℃)'].min():.1f}℃，"
-              f"降水量は1日合計 {rain.sum():.1f} mm でした．"]
+              f"降水量は1日合計 {rain.sum():.1f} mm{sun}でした（{w.attrs.get('short', '')}）．"]
         if rh:
             t4.append(f"0.5mm以上の雨が降ったのは {len(rh)} 時間（{', '.join(str(h) + '時' for h in rh[:8])}"
                       f"{' ほか' if len(rh) > 8 else ''}）です．")
@@ -519,7 +586,7 @@ def sheet_overview(wb, a, w, tx, tot, prev_tot):
     sheet_title(ws, f"日次レポート：{d.year}年{d.month}月{d.day}日（{wday}）{' ' + hname if hname else ''}",
                 f"集計期間：{d.month}/{d.day} 0:00 〜 {e.month}/{e.day} 0:00（15分ごと）　対象：横浜市中区・西区のHELLO CYCLING 25ステーション　"
                 f"区分：{kind}　自動作成：{datetime.now(JST):%Y/%m/%d %H:%M}")
-    for col, wdt in zip("ABCDEFGHIJKL", [30, 13, 13, 13, 4, 24, 13, 13, 13, 13, 13, 13]):
+    for col, wdt in zip("ABCDEFGHIJKL", [30, 13, 13, 13, 4, 26, 19, 19, 13, 13, 13, 13]):
         ws.column_dimensions[col].width = wdt
 
     # 主な数値
@@ -546,16 +613,19 @@ def sheet_overview(wb, a, w, tx, tot, prev_tot):
     ws.cell(row=end + 1, column=1, value="延べ時間＝25箇所それぞれの時間の合計．推定回数は15分ごとの増減から数えた下限の値．").font = F_NOTE
 
     # 天気
-    r2 = h2(ws, 4, 6, "天気（横浜市中区・西区付近）")
+    r2 = h2(ws, 4, 6, "天気（気象庁 横浜地方気象台：中区山手町）" if w is not None and "日照(分)" in w.columns
+            else "天気（横浜市中区・西区付近）")
     if w is not None:
         rain = w["降水量(mm)"].fillna(0)
         day = w[w["時"].between(7, 18)]["天気"].dropna()
         rows = [("日中（7〜18時）の天気", day.mode().iloc[0] if len(day) else "－"),
-                ("最高気温", f"{w['気温(℃)'].max():.1f} ℃"),
-                ("最低気温", f"{w['気温(℃)'].min():.1f} ℃"),
+                ("最高気温（1時間平均の最高）", f"{w['気温(℃)'].max():.1f} ℃"),
+                ("最低気温（1時間平均の最低）", f"{w['気温(℃)'].min():.1f} ℃"),
                 ("降水量（1日合計）", f"{rain.sum():.1f} mm"),
-                ("雨の時間（0.5mm以上）", f"{int((rain >= 0.5).sum())} 時間"),
-                ("出典", "Open-Meteo.com（CC BY 4.0）")]
+                ("雨の時間（0.5mm以上）", f"{int((rain >= 0.5).sum())} 時間")]
+        if "日照(分)" in w.columns and w["日照(分)"].notna().any():
+            rows.append(("日照時間（1日合計）", f"{w['日照(分)'].sum() / 60:.1f} 時間"))
+        rows.append(("出典", w.attrs.get("short", "")))
     else:
         rows = [("天気", "取得できませんでした")]
     for i, (k, v) in enumerate(rows, r2):
@@ -785,10 +855,11 @@ def sheet_hourly(wb, a, w):
     ws = wb.create_sheet("時間帯別")
     sheet_title(ws, "時間帯別の集計", "推定貸出・返却回数は「15分ごとのデータ」シートから数式で計算しています．")
     hr = a["hr"].copy()
-    cols = list(hr.columns) + (["気温(℃)", "降水量(mm)", "天気"] if w is not None else [])
+    wcols = [c for c in WEATHER_COLS if w is not None and c in w.columns]
+    cols = list(hr.columns) + wcols
     for j, t in enumerate(cols, 1):
         head_cell(ws.cell(row=4, column=j, value=t))
-        ws.column_dimensions[get_column_letter(j)].width = 11 if j > 1 else 6
+        ws.column_dimensions[get_column_letter(j)].width = 6 if j == 1 else 14 if t == "天気" else 11
     ws.row_dimensions[4].height = 42
     R = f"'{RAW_SHEET}'!"
     wmap = w.set_index("時") if w is not None else None
@@ -797,11 +868,13 @@ def sheet_hourly(wb, a, w):
         vals[6] = f'=-SUMIFS({R}$L:$L,{R}$C:$C,A{i},{R}$L:$L,"<0")'
         vals[7] = f'=SUMIFS({R}$L:$L,{R}$C:$C,A{i},{R}$L:$L,">0")'
         if wmap is not None:
-            vals += [wmap.loc[r.時, "気温(℃)"], wmap.loc[r.時, "降水量(mm)"], wmap.loc[r.時, "天気"]]
+            vals += [wmap.loc[r.時, c] for c in wcols]
         for j, v in enumerate(vals, 1):
             v = None if (not isinstance(v, str) and pd.isna(v)) else v
-            align = CENTER if j == 1 or (w is not None and j == len(cols)) else RIGHT
-            body_cell(ws.cell(row=i, column=j, value=v), align, "0.0" if j in (3, 4, 5, 6, 9, 10) else None)
+            name = cols[j - 1]
+            align = CENTER if j == 1 or name == "天気" else RIGHT
+            fmt = "0.0" if j in (3, 4, 5, 6) or name in ("気温(℃)", "降水量(mm)", "風速(m/s)") else "0" if name in ("日照(分)", "湿度(%)") else None
+            body_cell(ws.cell(row=i, column=j, value=v), align, fmt)
     end = 28
     t = end + 1
     body_cell(ws.cell(row=t, column=1, value="計"), CENTER)
@@ -814,7 +887,8 @@ def sheet_hourly(wb, a, w):
     ws.conditional_formatting.add(f"G5:G{end}", DataBarRule(start_type="num", start_value=0, end_type="max", color="ED7D31"))
     ws.conditional_formatting.add(f"H5:H{end}", DataBarRule(start_type="num", start_value=0, end_type="max", color="4472C4"))
     if w is not None:
-        ws.conditional_formatting.add(f"J5:J{end}", CellIsRule(operator="greaterThanOrEqual", formula=["0.5"], fill=FILL_EMPTY))
+        pc = get_column_letter(cols.index("降水量(mm)") + 1)
+        ws.conditional_formatting.add(f"{pc}5:{pc}{end}", CellIsRule(operator="greaterThanOrEqual", formula=["0.5"], fill=FILL_EMPTY))
     outline(ws, 4, 1, t, len(cols))
 
     # 時間帯 × ステーション（平均の貸出可能台数）
@@ -899,7 +973,7 @@ def sheet_help(wb):
         ("業者作業の候補", f"大きな増加・減少＝15分で枠内の台数が{BIG_CHANGE}台以上増減．整備らしい動き＝枠内の台数は同じまま貸出不可が減り貸出可能が増えた（バッテリー交換・車両の入れ替え・予約の取り消しのいずれか）"),
         ("文章（ポイント・わかること）", "データから自動で作成．推定や可能性を含むため，卒論に使う際は数値を確認してから使うこと"),
         ("自転車のデータ", "公共交通オープンデータ協議会（ODPT）が公開する HELLO CYCLING の GBFS（station_status / station_information）を15分ごとに取得"),
-        ("天気のデータ", "Open-Meteo.com（CC BY 4.0）の1時間ごとの気温・降水量・天気（北緯35.448°，東経139.630°）．観測値ではなく気象モデルの値"),
+        ("天気のデータ", "気象庁ホームページのアメダス「横浜」（横浜地方気象台，中区山手町．西区の中心から約3km）の10分ごとの観測値を1時間ごとにまとめたもの．気温・湿度・風速は1時間の平均，降水量・日照は1時間の合計．天気は降水量と日照時間から判定（0.5mm以上＝雨，7〜16時の日照30分以上＝晴れ，10分以上＝晴れ時々曇り，それ未満＝曇り，夜間は－）．アメダスが取れない場合は Open-Meteo.com（CC BY 4.0）の気象モデル値を使い，概要の出典欄にそう表示する"),
     ]
     for i, (k, v) in enumerate(rows, 3):
         a_, b_ = ws.cell(row=i, column=1, value=k), ws.cell(row=i, column=2, value=v)
