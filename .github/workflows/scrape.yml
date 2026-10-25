@@ -30,6 +30,37 @@ jobs:
       - name: Run scraper
         run: python scrape.py
 
+      # 日付が変わって最初の回（0:00）に，前日の日次レポートと集計ファイルを作る．
+      # まだレポートがない「終わった日」があるときだけ動く（それ以外の回は数秒で終わる）．
+      # ここで失敗しても，収集したデータのコミットは続ける．
+      - name: Make daily report (first run after midnight)
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        env:
+          TZ: Asia/Tokyo
+        run: |
+          NEED=$(python - <<'EOF'
+          import glob, os
+          from datetime import datetime, timedelta, timezone
+          today = datetime.now(timezone(timedelta(hours=9))).date()
+          for p in glob.glob("data/yokohama_stations_15min_log_raw_*.csv"):
+              d = datetime.strptime(os.path.basename(p)[-12:-4], "%Y%m%d").date()
+              e = d + timedelta(days=1)
+              out = f"reports/{d.year}/日次レポート_{d.month:02d}.{d.day:02d}-{e.month:02d}.{e.day:02d}.xlsx"
+              if d < today and not os.path.exists(out):
+                  print("yes")
+                  break
+          EOF
+          )
+          if [ "$NEED" = "yes" ]; then
+            pip install openpyxl holidays
+            python make_daily_report.py
+            python make_summary.py
+            python make_excel.py
+          else
+            echo "作成済み（スキップ）"
+          fi
+
       # 取得に失敗した回も，欠損行を記録するためにコミットする
       - name: Commit and push data
         if: ${{ !cancelled() }}
@@ -38,7 +69,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/
+          git add data/ reports/ summary/
           if git diff --staged --quiet; then
             echo "変更なし"
             exit 0

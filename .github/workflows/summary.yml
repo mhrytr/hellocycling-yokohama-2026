@@ -1,8 +1,8 @@
 name: Make Summary and Daily Report
 
 on:
-  schedule:
-    - cron: '5 15 * * *'    # 毎日 00:05 JST（GitHubの混雑で数十分遅れることがある）
+  # 毎日の自動作成は，収集（scrape.yml）の0時の回で行う．GitHubの時刻指定の実行は数時間遅れることがあるため．
+  # ここは手動で作り直したいとき用（Actions タブの Run workflow）
   workflow_dispatch:
 
 permissions:
